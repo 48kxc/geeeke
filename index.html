@@ -1,0 +1,436 @@
+<!--
+Cloudflare Pages — Stock Tracker (single-file site)
+Features
+- Beautiful, responsive UI (Tailwind CSS)
+- Always saves locally via localStorage (client-side persistence)
+- Add BUY/SELL/DIVIDEND with fees & notes
+- Metrics: portfolio value, cost basis, unrealized P&L and %; today's change
+- Charts (Chart.js): equity curve, allocation pie; per-ticker price panel
+- Price fetch from Alpha Vantage (free) — paste your API key in Settings
+- Local on-disk caching of prices with TTL to respect rate limits
+- Export/Import JSON to move data between devices
+
+Deploy on Cloudflare Pages
+- Create a new Pages project → "Upload assets" → drop this single index.html
+- Set no special build command (it's a static site)
+- Optional: set an environment variable ALPHA_VANTAGE_KEY at build-time and paste it the first time the app loads (client-only storage)
+
+Security note
+- This version stores your API key in your browser only (localStorage). For a server-side key, use Pages Functions + D1; I can provide that variant if you want.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>📈 Stock Tracker</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%93%88%3C/text%3E%3C/svg%3E"/>
+  <style>
+    :root { color-scheme: light dark; }
+    .card { @apply bg-white/70 dark:bg-slate-900/60 backdrop-blur rounded-2xl shadow p-4; }
+    .metric { @apply flex flex-col gap-1 rounded-xl p-3 shadow; }
+  </style>
+</head>
+<body class="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100 dark:from-slate-950 dark:to-slate-900 text-slate-900 dark:text-slate-100">
+  <div class="max-w-7xl mx-auto px-4 py-6">
+    <header class="flex items-center justify-between mb-6">
+      <h1 class="text-2xl md:text-3xl font-bold tracking-tight">📈 Personal Stock Tracker</h1>
+      <div class="flex items-center gap-2">
+        <button id="exportBtn" class="px-3 py-2 rounded-xl bg-slate-800 text-white hover:opacity-90">Export</button>
+        <label class="px-3 py-2 rounded-xl bg-slate-200 dark:bg-slate-800 cursor-pointer">
+          Import <input id="importFile" type="file" accept="application/json" class="hidden" />
+        </label>
+        <button id="settingsBtn" class="px-3 py-2 rounded-xl border border-slate-300 dark:border-slate-700">Settings</button>
+      </div>
+    </header>
+
+    <!-- Metrics -->
+    <section class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+      <div class="metric bg-white dark:bg-slate-800"><div class="text-xs uppercase text-slate-500">Portfolio Value</div><div id="mValue" class="text-2xl font-semibold">$0.00</div></div>
+      <div class="metric bg-white dark:bg-slate-800"><div class="text-xs uppercase text-slate-500">Cost Basis</div><div id="mCost" class="text-2xl font-semibold">$0.00</div></div>
+      <div class="metric bg-white dark:bg-slate-800"><div class="text-xs uppercase text-slate-500">Unrealized P&L</div><div class="flex items-baseline gap-2"><span id="mPnL" class="text-2xl font-semibold">$0.00</span><span id="mPnLPct" class="text-sm text-slate-500">—</span></div></div>
+      <div class="metric bg-white dark:bg-slate-800"><div class="text-xs uppercase text-slate-500">Today's Change</div><div id="mToday" class="text-2xl font-semibold">$0.00</div></div>
+    </section>
+
+    <!-- Main grid -->
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+      <div class="lg:col-span-2 flex flex-col gap-6">
+        <!-- Equity Curve -->
+        <div class="card">
+          <div class="flex items-center justify-between mb-2">
+            <h2 class="text-lg font-semibold">Equity Curve</h2>
+            <select id="lookback" class="px-2 py-1 rounded border dark:bg-slate-800 dark:border-slate-700">
+              <option value="90">90d</option>
+              <option value="180">180d</option>
+              <option value="365" selected>1y</option>
+              <option value="730">2y</option>
+            </select>
+          </div>
+          <canvas id="equityChart" height="120"></canvas>
+        </div>
+
+        <!-- Holdings Table -->
+        <div class="card overflow-x-auto">
+          <div class="flex items-center justify-between mb-3">
+            <h2 class="text-lg font-semibold">Holdings</h2>
+            <div class="text-sm text-slate-500">Click a symbol tab below for its price chart</div>
+          </div>
+          <table class="min-w-full text-sm">
+            <thead>
+              <tr class="text-left text-slate-500 border-b border-slate-200 dark:border-slate-700">
+                <th class="py-2 pr-4">Symbol</th>
+                <th class="py-2 pr-4">Shares</th>
+                <th class="py-2 pr-4">Avg Cost</th>
+                <th class="py-2 pr-4">Last</th>
+                <th class="py-2 pr-4">Value</th>
+                <th class="py-2 pr-4">Unrealized</th>
+                <th class="py-2 pr-4">Weight</th>
+              </tr>
+            </thead>
+            <tbody id="holdingsBody"></tbody>
+          </table>
+        </div>
+
+        <!-- Per Ticker Tabs -->
+        <div id="perTicker" class="card">
+          <div id="tabs" class="flex flex-wrap gap-2 mb-3"></div>
+          <canvas id="tickerChart" height="120"></canvas>
+        </div>
+      </div>
+
+      <div class="lg:col-span-1 flex flex-col gap-6">
+        <!-- Allocation Pie -->
+        <div class="card">
+          <h2 class="text-lg font-semibold mb-2">Allocation</h2>
+          <canvas id="allocChart" height="240"></canvas>
+        </div>
+
+        <!-- Add Transaction -->
+        <div class="card">
+          <h2 class="text-lg font-semibold mb-3">Add Transaction</h2>
+          <form id="txnForm" class="grid grid-cols-2 gap-3">
+            <div class="col-span-1">
+              <label class="text-xs text-slate-500">Date</label>
+              <input type="date" id="fDate" class="w-full px-3 py-2 rounded border dark:bg-slate-800 dark:border-slate-700" />
+            </div>
+            <div class="col-span-1">
+              <label class="text-xs text-slate-500">Type</label>
+              <select id="fType" class="w-full px-3 py-2 rounded border dark:bg-slate-800 dark:border-slate-700">
+                <option>BUY</option>
+                <option>SELL</option>
+                <option>DIVIDEND</option>
+              </select>
+            </div>
+            <div class="col-span-2">
+              <label class="text-xs text-slate-500">Symbol</label>
+              <input id="fSymbol" placeholder="AAPL" class="w-full px-3 py-2 rounded border uppercase dark:bg-slate-800 dark:border-slate-700"/>
+            </div>
+            <div class="col-span-1">
+              <label class="text-xs text-slate-500">Shares</label>
+              <input type="number" step="0.001" id="fShares" class="w-full px-3 py-2 rounded border dark:bg-slate-800 dark:border-slate-700"/>
+            </div>
+            <div class="col-span-1">
+              <label class="text-xs text-slate-500">Price</label>
+              <input type="number" step="0.01" id="fPrice" class="w-full px-3 py-2 rounded border dark:bg-slate-800 dark:border-slate-700"/>
+            </div>
+            <div class="col-span-2">
+              <label class="text-xs text-slate-500">Fee</label>
+              <input type="number" step="0.01" id="fFee" value="0" class="w-full px-3 py-2 rounded border dark:bg-slate-800 dark:border-slate-700"/>
+            </div>
+            <div class="col-span-2">
+              <label class="text-xs text-slate-500">Note</label>
+              <input id="fNote" class="w-full px-3 py-2 rounded border dark:bg-slate-800 dark:border-slate-700"/>
+            </div>
+            <button class="col-span-2 mt-1 px-4 py-2 rounded-xl bg-blue-600 text-white hover:opacity-90">Add</button>
+          </form>
+        </div>
+
+        <!-- Transactions -->
+        <div class="card">
+          <div class="flex items-center justify-between mb-3">
+            <h2 class="text-lg font-semibold">Transactions</h2>
+            <button id="undoBtn" class="text-sm px-2 py-1 rounded border dark:border-slate-700">Undo last</button>
+          </div>
+          <div id="txnList" class="text-sm max-h-72 overflow-y-auto space-y-2"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Settings Modal -->
+  <dialog id="settings" class="rounded-2xl p-0 w-[32rem] max-w-[95vw]">
+    <form method="dialog" class="card !rounded-2xl">
+      <h3 class="text-lg font-semibold mb-2">Settings</h3>
+      <label class="block text-sm mb-2">Alpha Vantage API key (for live prices):
+        <input id="apiKey" class="mt-1 w-full px-3 py-2 rounded border dark:bg-slate-800 dark:border-slate-700" placeholder="AVxxxxxxxxxxxx"/>
+      </label>
+      <p class="text-xs text-slate-500 mb-3">Get a free key at <a href="https://www.alphavantage.co/support/#api-key" target="_blank" class="underline">Alpha Vantage</a>. Your key is saved only in your browser.</p>
+      <div class="flex items-center justify-end gap-2">
+        <button class="px-3 py-2 rounded-xl" value="cancel">Cancel</button>
+        <button id="saveSettings" class="px-3 py-2 rounded-xl bg-blue-600 text-white" value="default">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+<script type="module">
+const $ = (sel) => document.querySelector(sel);
+const $$ = (sel) => Array.from(document.querySelectorAll(sel));
+const fmtMoney = (n) => (n===null||n===undefined||Number.isNaN(n)) ? '—' : (n<0?'-':'') + '$' + Math.abs(n).toLocaleString(undefined,{minimumFractionDigits:2, maximumFractionDigits:2});
+const todayISO = () => new Date().toISOString().slice(0,10);
+
+const LS = {
+  load(){
+    try{ return JSON.parse(localStorage.getItem('stocktracker:data')||'{"tx":[],"key":"","cache":{}}'); }catch{ return {tx:[], key:'', cache:{}} }
+  },
+  save(d){ localStorage.setItem('stocktracker:data', JSON.stringify(d)); }
+};
+let state = LS.load();
+
+// --- Price Cache helpers ---
+const CACHE_TTL_MS = 12*60*60*1000; // 12h
+function getCachedSeries(symbol){
+  const c = state.cache?.[symbol];
+  if(!c) return null;
+  if(Date.now()-c.savedAt > CACHE_TTL_MS) return null;
+  return c.series; // [{date, close}]
+}
+function setCachedSeries(symbol, series){
+  state.cache = state.cache || {};
+  state.cache[symbol] = { savedAt: Date.now(), series };
+  LS.save(state);
+}
+
+// --- Alpha Vantage fetch (TIME_SERIES_DAILY_ADJUSTED) ---
+async function fetchDaily(symbol){
+  const cached = getCachedSeries(symbol);
+  if(cached) return cached;
+  const key = state.key?.trim();
+  if(!key){ throw new Error('Missing Alpha Vantage API key. Open Settings and add your key.'); }
+  const url = `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY_ADJUSTED&symbol=${encodeURIComponent(symbol)}&apikey=${encodeURIComponent(key)}&outputsize=compact`;
+  const res = await fetch(url);
+  const data = await res.json();
+  if(data['Error Message']) throw new Error('Alpha Vantage error: bad symbol or request.');
+  if(data['Note']) throw new Error('Rate limit hit. Try again in a minute.');
+  const series = Object.entries(data['Time Series (Daily)']||{})
+    .map(([d, o])=>({date:d, close: parseFloat(o['5. adjusted close'])}))
+    .sort((a,b)=> a.date.localeCompare(b.date));
+  if(series.length===0) throw new Error('No price data.');
+  setCachedSeries(symbol, series);
+  return series;
+}
+
+// --- Transactions model ---
+function addTxn(tx){ state.tx.push(tx); LS.save(state); }
+function undoLast(){ state.tx.pop(); LS.save(state); }
+function listSymbols(){ return [...new Set(state.tx.map(t=>t.symbol.toUpperCase()))]; }
+
+function computePositions(){
+  const buys = new Map(); // symbol -> {shares, cost}
+  const sells = new Map();
+  for(const t of state.tx){
+    const s = t.symbol.toUpperCase();
+    if(t.type==='BUY'){
+      const b = buys.get(s) || {shares:0, cost:0};
+      b.shares += Number(t.shares);
+      b.cost += Number(t.shares)*Number(t.price) + Number(t.fee||0);
+      buys.set(s,b);
+    } else if(t.type==='SELL'){
+      const b = sells.get(s) || {shares:0};
+      b.shares += Number(t.shares);
+      sells.set(s,b);
+    }
+  }
+  const positions = [];
+  for(const [sym,b] of buys.entries()){
+    const net = b.shares - (sells.get(sym)?.shares||0);
+    if(net<=0) continue;
+    const avg = b.cost / b.shares;
+    positions.push({symbol:sym, shares:net, avgCost:avg});
+  }
+  return positions.sort((a,b)=> a.symbol.localeCompare(b.symbol));
+}
+
+async function enrichWithPrices(positions){
+  const out = [];
+  for(const p of positions){
+    try{
+      const series = await fetchDaily(p.symbol);
+      const last = series[series.length-1]?.close;
+      const prev = series[series.length-2]?.close ?? last;
+      const value = p.shares * last;
+      const cost = p.shares * p.avgCost;
+      const pnl = value - cost;
+      const pnlPct = cost>0 ? pnl/cost : 0;
+      const today = (last - prev) * p.shares;
+      out.push({...p, last, value, cost, pnl, pnlPct, today, series});
+    }catch(err){
+      console.warn('Price fetch failed for', p.symbol, err);
+      const value = 0, cost = p.shares*p.avgCost, pnl = -cost, last = NaN;
+      out.push({...p, last, value, cost, pnl, pnlPct: -1, today:0, series: []});
+    }
+  }
+  return out;
+}
+
+// --- Rendering ---
+let equityChart, allocChart, tkrChart;
+
+function renderHoldingsTable(rows){
+  const tb = $('#holdingsBody');
+  tb.innerHTML = '';
+  const total = rows.reduce((s,r)=> s + r.value, 0);
+  for(const r of rows){
+    const tr = document.createElement('tr');
+    tr.className = 'border-b border-slate-100 dark:border-slate-800 hover:bg-slate-50/40 dark:hover:bg-slate-800/30';
+    tr.innerHTML = `
+      <td class="py-2 pr-4 font-semibold">${r.symbol}</td>
+      <td class="py-2 pr-4">${r.shares.toFixed(3)}</td>
+      <td class="py-2 pr-4">${fmtMoney(r.avgCost)}</td>
+      <td class="py-2 pr-4">${Number.isNaN(r.last)?'—':fmtMoney(r.last)}</td>
+      <td class="py-2 pr-4">${fmtMoney(r.value)}</td>
+      <td class="py-2 pr-4 ${r.pnl>=0?'text-emerald-600':'text-rose-600'}">${fmtMoney(r.pnl)} (${(r.pnlPct*100).toFixed(2)}%)</td>
+      <td class="py-2 pr-4">${total>0 ? (r.value/total*100).toFixed(2)+'%' : '—'}</td>`;
+    tb.appendChild(tr);
+  }
+}
+
+function renderMetrics(rows){
+  const total = rows.reduce((s,r)=> s + r.value, 0);
+  const cost = rows.reduce((s,r)=> s + r.cost, 0);
+  const pnl = total - cost;
+  const today = rows.reduce((s,r)=> s + r.today, 0);
+  $('#mValue').textContent = fmtMoney(total);
+  $('#mCost').textContent = fmtMoney(cost);
+  $('#mPnL').textContent = fmtMoney(pnl);
+  $('#mPnLPct').textContent = cost>0? `(${(pnl/cost*100).toFixed(2)}%)` : '—';
+  $('#mToday').textContent = fmtMoney(today);
+}
+
+function renderAlloc(rows){
+  const labels = rows.map(r=>r.symbol);
+  const data = rows.map(r=>r.value);
+  if(allocChart) allocChart.destroy();
+  allocChart = new Chart($('#allocChart'), {
+    type: 'pie', data: { labels, datasets: [{ data }] }, options: { plugins:{ legend:{ position:'bottom' } } }
+  });
+}
+
+function buildEquitySeries(rows, lookbackDays){
+  const map = new Map(); // date -> value
+  const toISO = (d)=> d.toISOString().slice(0,10);
+  const start = new Date(Date.now() - lookbackDays*24*3600*1000);
+  for(const r of rows){
+    for(const pt of r.series){
+      const d = new Date(pt.date);
+      if(d<start) continue;
+      const key = toISO(d);
+      map.set(key, (map.get(key)||0) + (pt.close * r.shares));
+    }
+  }
+  const arr = [...map.entries()].sort((a,b)=> a[0].localeCompare(b[0]));
+  return { labels: arr.map(a=>a[0]), data: arr.map(a=>a[1]) };
+}
+
+function renderEquity(rows){
+  const lookback = Number($('#lookback').value);
+  const {labels, data} = buildEquitySeries(rows, lookback);
+  if(equityChart) equityChart.destroy();
+  equityChart = new Chart($('#equityChart'), {
+    type: 'line', data: { labels, datasets: [{ label:'Equity', data, fill:false }]},
+    options: { scales:{ y:{ ticks:{ callback:(v)=> '$'+Number(v).toLocaleString() } } } }
+  });
+}
+
+function renderPerTickerTabs(rows){
+  const tabs = $('#tabs');
+  tabs.innerHTML = '';
+  for(const r of rows){
+    const btn = document.createElement('button');
+    btn.className = 'px-3 py-1 rounded-xl border text-sm dark:border-slate-700 hover:bg-slate-50/40 dark:hover:bg-slate-800/30';
+    btn.textContent = r.symbol;
+    btn.onclick = ()=> renderTickerChart(r);
+    tabs.appendChild(btn);
+  }
+  if(rows[0]) renderTickerChart(rows[0]);
+}
+
+function renderTickerChart(r){
+  if(tkrChart) tkrChart.destroy();
+  const labels = r.series.map(p=>p.date);
+  const data = r.series.map(p=>p.close);
+  tkrChart = new Chart($('#tickerChart'), {
+    type: 'line', data: { labels, datasets: [{ label: r.symbol, data }]}, options:{ scales:{ y:{ ticks:{ callback:(v)=>'$'+Number(v).toLocaleString() }}}}
+  });
+}
+
+function renderTxns(){
+  const box = $('#txnList'); box.innerHTML='';
+  const tx = [...state.tx].slice(-200).reverse();
+  for(const t of tx){
+    const div = document.createElement('div');
+    div.className = 'flex items-center justify-between border rounded-xl px-3 py-2 dark:border-slate-700';
+    div.innerHTML = `<div><span class='font-semibold'>${t.symbol}</span> ${t.type} • ${t.shares} @ ${fmtMoney(t.price)} <span class='text-xs text-slate-500'>${t.date}</span></div><div class='text-xs text-slate-500'>fee ${fmtMoney(Number(t.fee||0))}${t.note? ' • '+t.note:''}</div>`;
+    box.appendChild(div);
+  }
+}
+
+async function refresh(){
+  const positions = computePositions();
+  const rows = await enrichWithPrices(positions);
+  renderMetrics(rows);
+  renderHoldingsTable(rows);
+  renderAlloc(rows);
+  renderEquity(rows);
+  renderPerTickerTabs(rows);
+  renderTxns();
+}
+
+// --- Event wiring ---
+$('#lookback').addEventListener('change', ()=> refresh());
+$('#undoBtn').addEventListener('click', ()=> { undoLast(); refresh(); });
+$('#exportBtn').addEventListener('click', ()=>{
+  const blob = new Blob([JSON.stringify(state)], {type:'application/json'});
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'stocktracker-export.json'; a.click();
+});
+$('#importFile').addEventListener('change', async (ev)=>{
+  const file = ev.target.files?.[0]; if(!file) return;
+  const text = await file.text();
+  try{ const data = JSON.parse(text); if(!data.tx) throw new Error('Invalid file'); state = data; LS.save(state); await refresh(); alert('Import successful.'); }catch(err){ alert('Import failed: '+err.message); }
+});
+$('#settingsBtn').addEventListener('click', ()=> { $('#apiKey').value = state.key || ''; $('#settings').showModal(); });
+$('#saveSettings').addEventListener('click', (e)=> { e.preventDefault(); state.key = $('#apiKey').value.trim(); LS.save(state); $('#settings').close(); refresh(); });
+
+$('#txnForm').addEventListener('submit', async (e)=>{
+  e.preventDefault();
+  const tx = {
+    date: $('#fDate').value || todayISO(),
+    type: $('#fType').value,
+    symbol: ($('#fSymbol').value||'').trim().toUpperCase(),
+    shares: Number($('#fShares').value||0),
+    price: Number($('#fPrice').value||0),
+    fee: Number($('#fFee').value||0),
+    note: ($('#fNote').value||'').trim()
+  };
+  if(!tx.symbol){ alert('Enter a symbol.'); return; }
+  if(tx.type!=='DIVIDEND' && (tx.shares<=0 || tx.price<=0)){ alert('Shares and price must be > 0.'); return; }
+  addTxn(tx);
+  // bust price cache for this symbol to reflect new holdings on charts immediately (price series unchanged)
+  await refresh();
+  // clear form
+  $('#fSymbol').value=''; $('#fShares').value=''; $('#fPrice').value=''; $('#fFee').value='0'; $('#fNote').value='';
+});
+
+// Seed date default
+$('#fDate').value = todayISO();
+
+// Initial render
+refresh().catch(err=>{
+  console.warn(err);
+  // Show a friendly prompt to add API key
+  $('#mValue').textContent = 'Add API key in Settings';
+});
+</script>
+</body>
+</html>
