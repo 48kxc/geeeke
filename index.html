@@ -45,6 +45,7 @@ Security note
         <button id="settingsBtn" class="px-3 py-2 rounded-xl border border-slate-300 dark:border-slate-700">Settings</button>
       </div>
     </header>
+    <div id="status" class="hidden mb-4 p-3 rounded-xl border text-sm bg-amber-50 border-amber-200 text-amber-900 dark:bg-amber-900/20 dark:border-amber-800 dark:text-amber-200"></div>
 
     <!-- Metrics -->
     <section class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
@@ -204,21 +205,59 @@ function setCachedSeries(symbol, series){
 
 // --- Alpha Vantage fetch (TIME_SERIES_DAILY_ADJUSTED) ---
 async function fetchDaily(symbol){
+  // Try cache first
   const cached = getCachedSeries(symbol);
   if(cached) return cached;
+
+  // 1) Try Alpha Vantage DAILY (free) first
   const key = state.key?.trim();
-  if(!key){ throw new Error('Missing Alpha Vantage API key. Open Settings and add your key.'); }
-  const url = `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY_ADJUSTED&symbol=${encodeURIComponent(symbol)}&apikey=${encodeURIComponent(key)}&outputsize=compact`;
-  const res = await fetch(url);
-  const data = await res.json();
-  if(data['Error Message']) throw new Error('Alpha Vantage error: bad symbol or request.');
-  if(data['Note']) throw new Error('Rate limit hit. Try again in a minute.');
-  const series = Object.entries(data['Time Series (Daily)']||{})
-    .map(([d, o])=>({date:d, close: parseFloat(o['5. adjusted close'])}))
-    .sort((a,b)=> a.date.localeCompare(b.date));
-  if(series.length===0) throw new Error('No price data.');
-  setCachedSeries(symbol, series);
-  return series;
+  if(key){
+    const avUrlDaily = `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=${encodeURIComponent(symbol)}&apikey=${encodeURIComponent(key)}&outputsize=compact&datatype=json`;
+    const res = await fetch(avUrlDaily);
+    if(res.ok){
+      const data = await res.json();
+      if(data['Time Series (Daily)']){
+        const ts = data['Time Series (Daily)'];
+        const series = Object.entries(ts)
+          .map(([d,o])=>({date:d, close: parseFloat(o['4. close'])}))
+          .filter(p=>Number.isFinite(p.close))
+          .sort((a,b)=> a.date.localeCompare(b.date));
+        if(series.length){ setCachedSeries(symbol, series); return series; }
+      }
+      if(data['Information'] && String(data['Information']).includes('premium endpoint')){
+        // fall through to Stooq
+      } else if(data['Note']){
+        throw new Error('Alpha Vantage rate limit reached (free: ~5/min, 500/day). Wait a minute and refresh.');
+      }
+    }
+  }
+
+  // 2) Fallback: Stooq CSV (no key). US tickers typically need .us suffix
+  const stooqSym = `${symbol.toLowerCase()}.us`;
+  const stooqUrl = `https://stooq.com/q/d/l/?s=${encodeURIComponent(stooqSym)}&i=d`;
+  const csvRes = await fetch(stooqUrl);
+  if(csvRes.ok){
+    const csv = await csvRes.text();
+    // Parse simple CSV: Date,Open,High,Low,Close,Volume
+    const lines = csv.trim().split(/
+?
+/).slice(1);
+    const series = lines.map(line=>{
+      const [d, , , , close] = line.split(',');
+      return {date: d, close: parseFloat(close)};
+    }).filter(p=>Number.isFinite(p.close)).sort((a,b)=> a.date.localeCompare(b.date));
+    if(series.length){ setCachedSeries(symbol, series); return series; }
+  }
+
+  throw new Error('No price data available from Alpha Vantage (premium endpoint) or Stooq fallback.');
+}
+
+// Surface the last error nicely in the UI
+function showStatus(msg, tone='warn'){
+  const box = document.getElementById('status');
+  if(!box) return;
+  box.classList.remove('hidden');
+  box.textContent = msg;
 }
 
 // --- Transactions model ---
@@ -377,14 +416,19 @@ function renderTxns(){
 }
 
 async function refresh(){
-  const positions = computePositions();
-  const rows = await enrichWithPrices(positions);
-  renderMetrics(rows);
-  renderHoldingsTable(rows);
-  renderAlloc(rows);
-  renderEquity(rows);
-  renderPerTickerTabs(rows);
-  renderTxns();
+  try{
+    const positions = computePositions();
+    const rows = await enrichWithPrices(positions);
+    renderMetrics(rows);
+    renderHoldingsTable(rows);
+    renderAlloc(rows);
+    renderEquity(rows);
+    renderPerTickerTabs(rows);
+    renderTxns();
+  }catch(err){
+    console.warn(err);
+    showStatus(String(err.message||err));
+  }
 }
 
 // --- Event wiring ---
